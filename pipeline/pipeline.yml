@@ -1,0 +1,34 @@
+#C1: built-in tasks for Azure Pipelines https://learn.microsoft.com/en-us/azure/devops/pipelines/tasks/reference/?view=azure-pipelines
+trigger:
+  branches:
+    include:
+    - main
+
+pr:
+  branches:
+    include:
+    - main
+
+parameters:
+  - name: destroy
+    displayName: Destroy
+    type: boolean
+    default: false
+
+  - name: deploymentMode
+    displayName: "Deployment Mode"
+    type: string
+    default: "Plan Only"
+    values:
+    - "Deploy"
+    - "Plan Only"
+
+
+variables:
+- template: /.pipelines/config/dev.config.yml
+
+jobs:
+- template: /.pipelines/02_jobs/job_terraform.yml
+  parameters:
+    destroy: ${{ parameters.destroy }}
+    deploymentMode: ${{ parameters.deploymentMode }}
