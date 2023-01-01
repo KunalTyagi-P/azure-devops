@@ -1,0 +1,165 @@
+jobs:
+- job:
+  timeoutInMinutes: 0 # value of 0 should let job run indefinitely for sellf-hosted agents.
+  pool: $(POOL)
+  steps:
+  - task: InstallSSHKey@0
+    inputs:
+      knownHostsEntry: "$(SSH_KNOWN_HOST)"
+      sshPublicKey:  "$(SSH_PUBLIC_KEY)"
+      sshKeySecureFile: repos.key
+
+########Terraform Install#########
+
+  - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@0
+    displayName: "Install TF $(TERRAFORM_VERSION)"
+    inputs:
+      terraformVersion: $(TERRAFORM_VERSION)
+
+########Terraform Init###########
+
+  - task: AzureCLI@2
+    displayName: "TF: Init"
+    condition: |
+      and
+      (
+        not(canceled()),
+        not(failed())
+      )
+    inputs:
+      addSpnToEnvironment: true
+      azureSubscription: $(SVC_CONNECTION)
+      scriptLocation: inlineScript
+      scriptType: pscore
+      workingDirectory: $(Build.SourcesDirectory)/org/account_template
+      inlineScript: |
+        write-host "Using Service Connection"
+        $env:ARM_CLIENT_ID = $env:servicePrincipalId
+        $env:ARM_CLIENT_SECRET = $env:servicePrincipalKey
+        write-host "##vso[task.setvariable variable=ARM_CLIENT_ID]$env:ARM_CLIENT_ID"
+        write-host "##vso[task.setvariable variable=ARM_CLIENT_SECRET]$env:ARM_CLIENT_SECRET"
+        write-host "##vso[task.setvariable variable=TF_VAR_ARM_CLIENT_ID]$env:ARM_CLIENT_ID"
+        write-host "##vso[task.setvariable variable=TF_VAR_ARM_CLIENT_SECRET]$env:ARM_CLIENT_SECRET"
+        $env:ARM_SUBSCRIPTION_ID = az account show --query id -o tsv
+        write-host "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID]$env:ARM_SUBSCRIPTION_ID"
+        write-host "##vso[task.setvariable variable=TF_VAR_ARM_SUBSCRIPTION_ID]$env:ARM_SUBSCRIPTION_ID"
+        $env:ARM_TENANT_ID= $env:tenantId
+        write-host "##vso[task.setvariable variable=ARM_TENANT_ID]$env:tenantId"
+        write-host "##vso[task.setvariable variable=TF_VAR_ARM_TENANT_ID]$env:tenantId"
+        Import-Module $(Build.SourcesDirectory)/scripts/namingStd.psm1
+        $namingReqs       = @{
+          environment     = '$(TERRAFORM_ENVIRONMENT)'
+          location        = '$(TERRAFORM_LOCATION)'
+          subscription    = $env:ARM_SUBSCRIPTION_ID
+        }
+        $rg = "$((Get-NamingStandard @namingReqs -reference "resource-group"))-dataft-terraform"
+        $sa = "$((Get-NamingStandard @namingReqs -reference "storage-account"))dataft"
+        $subID = $env:ARM_SUBSCRIPTION_ID
+        terraform init -reconfigure `
+          -backend-config="resource_group_name=$rg" `
+          -backend-config="storage_account_name=$sa" `
+          -backend-config="container_name=nbs-dataft-azdo-tfstate-main" `
+          -backend-config="key=terraform_sqldb.tfstate" `
+          -backend-config="subscription_id=$subID"
+########Terraform Validate#########
+
+  - script: terraform validate
+    displayName: "TF: Validate"
+    workingDirectory: $(Build.SourcesDirectory)/org/account_template
+    continueOnError: true
+
+########Terraform fmt check#########
+       
+  - task: Bash@3
+    displayName: "TF: fmt"
+    continueOnError: true
+    inputs:
+      failOnStdErr: true
+      targetType: inline
+      workingDirectory: $(Build.SourcesDirectory)/org/account_template
+      script: |
+        terraform fmt -check -recursive
+        if [ $? -eq 0 ] ; then
+          echo "Code changes are compliant with 'terraform fmt'"
+        else
+          echo "##vso[task.logissue type=error]Code changes are not compliant with 'terraform fmt' - Please execute 'terraform fmt -recursive' from the repo root."
+          exit 1
+        fi
+########Terraform Plan#########
+
+  - task: AzureCLI@2
+    displayName: "TF: Plan"
+    continueOnError: true
+    condition: |
+      and
+      (
+        not(canceled()),
+        not(failed())
+      )
+    env:
+      AAD_SERVICE_PRINCIPAL_CLIENT_ID: $(ARM_CLIENT_ID)
+      AAD_SERVICE_PRINCIPAL_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+    inputs:
+      azureSubscription: $(SVC_CONNECTION)
+      scriptLocation: inlineScript
+      scriptType: pscore
+      workingDirectory: $(Build.SourcesDirectory)/org/account_template
+      inlineScript: |
+        If ('${{ parameters.destroy }}' -eq $true) {
+          write-host "Running in destroy mode"
+          $destroy = " -destroy"
+        } else {
+          $destroy = ""
+        }
+        $cmd = "terraform plan -input=false -out=tfplan $destroy -detailed-exitcode -parallelism=100 -var-file=`"../spoke/dev/terraform.tfvars`""
+        write-host "##[command]$cmd"
+        Invoke-Expression $cmd
+        switch ($LASTEXITCODE) {
+          0 {
+            write-host '##vso[task.setvariable variable=planExitCode]0'
+            write-host "No changes. Infrastructure is up-to-date!"
+          }
+          1 {
+            write-host '##vso[task.setvariable variable=planExitCode]1'
+            write-host "Terraform plan has failed!"
+            exit 1
+          }
+          2 {
+            write-host '##vso[task.setvariable variable=planExitCode]2'
+            write-host "Changes have been noticed!"
+            exit 0
+          }
+          default {
+            write-host "Terraform plan has failed!"
+            exit 1
+          }
+        }
+########Terraform Apply#########
+
+  - task: AzureCLI@2
+    displayName: "TF: Apply"
+    continueOnError: true
+    condition: |
+      and
+        (
+          ne(canceled(), true),
+          ne(failed(), true),
+          ne('${{ parameters.deploymentMode }}', 'Plan Only'),
+          eq(variables['planExitCode'], '2')
+        )
+    inputs:
+      azureSubscription: $(SVC_CONNECTION)
+      scriptLocation: inlineScript
+      scriptType: pscore
+      workingDirectory: $(Build.SourcesDirectory)/org/account_template
+      inlineScript: |
+        write-host "Enable blob snapshot of current state file through Terraform Provider"
+        $env:ARM_SNAPSHOT='true'
+        $cmd = "terraform apply -parallelism=100 tfplan"
+        write-host "##[command]$cmd"
+        Invoke-Expression $cmd
+        If ($LASTEXITCODE -ne 0) {
+          exit 1
+        } else {
+          Remove-Item ./tfplan -force
+        }
